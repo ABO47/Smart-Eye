@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QMenu,
-    QStackedWidget,
     QSystemTrayIcon,
     QWidget,
 )
@@ -31,6 +30,7 @@ from backend.services.service_manager import get_service_manager
 from frontend.widgets.alert_popup import show_alert
 from frontend.navigation import nav_label_map
 from frontend.widgets.auth_overlay import AuthOverlay
+from frontend.widgets.animated_stack import AnimatedStackedWidget
 from frontend.widgets.sidebar import SidebarWidget, LOGO_ICON_PATH
 from frontend.theme_runtime import invalidate_theme_cache
 from frontend.state.session import build_trusted_user, compute_access, pick_initial_tab
@@ -75,7 +75,7 @@ class MainWindow(QMainWindow):
             current_theme=self._current_theme,
         )
 
-        self._stack = QStackedWidget()
+        self._stack = AnimatedStackedWidget()
         self._stack.setStyleSheet("background: transparent;")
 
         main_layout.addWidget(self._sidebar)
