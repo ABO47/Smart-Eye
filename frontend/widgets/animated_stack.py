@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QPoint
+from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QPoint, Signal
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QStackedWidget, QWidget
 
 
 class AnimatedStackedWidget(QStackedWidget):
+    transition_finished = Signal(QWidget)
+
     def __init__(
         self,
         parent: QWidget | None = None,
@@ -12,12 +14,14 @@ class AnimatedStackedWidget(QStackedWidget):
         duration: int = 200,
         offset: int = 10,
         use_fade: bool = True,
+        max_fade_pixels: int | None = 1_000_000,
         easing: QEasingCurve.Type = QEasingCurve.Type.OutCubic,
     ) -> None:
         super().__init__(parent)
         self._anim_duration = duration
         self._anim_offset = offset
         self._use_fade = use_fade
+        self._max_fade_pixels = max_fade_pixels
         self._easing = easing
         self._anim_group: QParallelAnimationGroup | None = None
         self._anim_target: QWidget | None = None
@@ -42,11 +46,13 @@ class AnimatedStackedWidget(QStackedWidget):
                 self._anim_group.stop()
                 self._cleanup_animation()
         super().setCurrentWidget(widget)
-        if not self._use_fade and self._anim_offset <= 0:
+        use_fade = self._should_fade(widget)
+        if not use_fade and self._anim_offset <= 0:
+            self.transition_finished.emit(widget)
             return
-        self._animate_in(widget)
+        self._animate_in(widget, use_fade)
 
-    def _animate_in(self, widget: QWidget) -> None:
+    def _animate_in(self, widget: QWidget, use_fade: bool) -> None:
         self._animating = True
         final_pos = widget.pos()
         start_pos = QPoint(final_pos.x(), final_pos.y() + self._anim_offset)
@@ -62,7 +68,7 @@ class AnimatedStackedWidget(QStackedWidget):
 
         effect = None
         self._owns_effect = False
-        if self._use_fade:
+        if use_fade:
             current_effect = widget.graphicsEffect()
             if current_effect is None:
                 effect = QGraphicsOpacityEffect(widget)
@@ -85,6 +91,17 @@ class AnimatedStackedWidget(QStackedWidget):
         group.finished.connect(self._on_anim_finished)
         group.start()
 
+    def _should_fade(self, widget: QWidget) -> bool:
+        if not self._use_fade:
+            return False
+        if self._max_fade_pixels is None:
+            return True
+        w = widget.width() or widget.sizeHint().width()
+        h = widget.height() or widget.sizeHint().height()
+        if w <= 0 or h <= 0:
+            return True
+        return (w * h) <= self._max_fade_pixels
+
     def _cleanup_animation(self) -> None:
         if self._owns_effect and self._anim_target is not None:
             if self._anim_target.graphicsEffect() is not None:
@@ -96,6 +113,9 @@ class AnimatedStackedWidget(QStackedWidget):
 
     def _on_anim_finished(self) -> None:
         self._cleanup_animation()
+        current = self.currentWidget()
+        if current is not None:
+            self.transition_finished.emit(current)
         if self._pending_widget is not None and self._pending_widget != self.currentWidget():
             pending = self._pending_widget
             self._pending_widget = None

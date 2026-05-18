@@ -130,16 +130,12 @@ class MainWindow(QMainWindow):
         self._build_auth_overlay()
         self._init_system_tray()
         if "dashboard" in self._pages:
+            page = self._pages.get("dashboard")
+            self._schedule_page_activation(page)
             self._stack.setCurrentWidget(self._pages["dashboard"])
             self._sidebar.set_active("dashboard")
             self._current_key = "dashboard"
             self._mark_active("dashboard")
-            try:
-                page = self._pages.get("dashboard")
-                if page is not None and hasattr(page, "on_activated"):
-                    page.on_activated()
-            except Exception:
-                pass
             self._log_page_state("startup")
         self._sidebar.set_access(set(), False)
         if self._auth_required:
@@ -187,17 +183,33 @@ class MainWindow(QMainWindow):
                 current.on_deactivated()
         if prev_key:
             self._release_services(prev_key)
+        page = self._pages[key]
+        self._schedule_page_activation(page)
         self._stack.setCurrentWidget(self._pages[key])
         self._sidebar.set_active(key)
-        page = self._pages[key]
         self._current_key = key
         self._mark_active(key)
         self._acquire_services(key)
-        if hasattr(page, "on_activated"):
-            page.on_activated()
         if prev_key and prev_key != key:
             self._maybe_unload_on_leave(prev_key)
         self._log_page_state(f"navigated:{key}")
+
+    def _schedule_page_activation(self, page) -> None:
+        if page is None or not hasattr(page, "on_activated"):
+            return
+        if isinstance(self._stack, AnimatedStackedWidget):
+            def _on_finish(widget):
+                with contextlib.suppress(Exception):
+                    self._stack.transition_finished.disconnect(_on_finish)
+                if widget is page:
+                    try:
+                        page.on_activated()
+                    except Exception:
+                        pass
+
+            self._stack.transition_finished.connect(_on_finish)
+        else:
+            QTimer.singleShot(0, page.on_activated)
 
     def _on_theme_changed(self, theme_name: str) -> None:
         try:
