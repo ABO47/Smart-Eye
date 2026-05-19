@@ -32,6 +32,163 @@ came from Kaggle. So this guide explains that training workflow clearly, then
 explains the actual app code exactly as it exists in this repository.
 
 
+0. Beginner learning path for this project
+-----------------------------------------
+
+This project has two main AI systems:
+- object detection (OD)
+- face recognition (FR)
+
+It also has a plugin design so object detectors can be registered and reloaded.
+The goal of this section is to give you a complete beginner path from zero to
+understanding this exact app.
+
+A. Start with the basics
+------------------------
+
+1. Learn Python fundamentals:
+   - variables, functions, loops, conditionals, and data structures.
+   - the app is written in Python, so understanding Python is the first step.
+
+2. Learn NumPy basics:
+   - NumPy arrays are used to represent images and face embeddings.
+   - images become arrays of shape [height, width, channels].
+   - embeddings become arrays of shape [512] or similar.
+
+3. Learn basic computer vision ideas:
+   - images are pixels and colors.
+   - video is many frames per second.
+   - detection means finding objects and drawing boxes around them.
+
+B. Learn the object detection model flow
+----------------------------------------
+
+1. Understand object detection:
+   - object detection finds objects in an image.
+   - it returns bounding boxes, class labels, and confidence scores.
+   - typical output looks like: [x1, y1, x2, y2, class, score].
+
+2. Learn YOLO basics:
+   - YOLO means "You Only Look Once." It predicts all objects in one pass.
+   - YOLO divides an image into a grid and predicts boxes and classes for each
+     cell.
+   - the advantage is speed: it can run in real time on video.
+
+3. In this project, YOLO is the training/original architecture:
+   - the shipped object model is a YOLO-style detector.
+   - it was trained/fine-tuned on a safety dataset.
+   - the model file is exported to ONNX and used by the app.
+
+4. Learn ONNX:
+   - ONNX stands for Open Neural Network Exchange.
+   - it is a common file format for trained models.
+   - ONNX lets the app run the model without the original training framework.
+   - the app uses ONNX Runtime to load and execute the model.
+
+5. Understand the difference: training vs inference
+   - training is how the model learns from labeled images.
+   - inference is how the model makes predictions on new images.
+   - Smart Eye only does inference at runtime.
+   - the ONNX model is already trained before the app runs.
+
+C. Learn face recognition basics
+--------------------------------
+
+1. Understand face detection vs recognition:
+   - face detection finds faces in an image.
+   - face recognition identifies whose face it is.
+
+2. Learn embeddings:
+   - an embedding is a numerical vector representing a face.
+   - similar faces produce similar embeddings.
+   - comparing embeddings is how recognition works.
+
+3. This project uses InsightFace for the face system:
+   - InsightFace is a pretrained face recognition package.
+   - it detects faces and creates embeddings.
+   - Smart Eye stores known people as embeddings in SQLite.
+   - when a new face appears, the app compares its embedding to stored ones.
+
+4. Learn similarity and thresholds:
+   - embeddings are compared using similarity scores.
+   - if the score is above a threshold, the face is recognized.
+   - if not, the face is treated as unknown.
+
+D. Learn how this app combines both systems
+-------------------------------------------
+
+1. Camera frames arrive from webcams, RTSP, or video files.
+2. A detector manager processes each frame.
+3. The object model finds safety objects and violations.
+4. The face model detects faces and identifies known people.
+5. The results are converted into state objects for rules and alarms.
+6. The UI displays live cameras, detections, recognized people, and alerts.
+
+E. Learn the plugin and reload behavior
+---------------------------------------
+
+1. The app uses a plugin system for OD models:
+   - `model_plugins` stores registered detection models.
+   - `plugin_classes` stores the classes each model can detect.
+   - `camera_plugins` stores which cameras use which models.
+
+2. The default shipped model is `data/models/Obj-Detection.onnx`.
+3. Reload Plugins is used when model settings change:
+   - it refreshes which models are enabled.
+   - it reloads the ONNX plugin state without restarting the app.
+   - it is useful after changing plugin assignments or fixing a model.
+
+F. Learn the exact project files to read next
+--------------------------------------------
+
+Start with these files after the concepts are clear:
+- `backend/models/onnx_object_model.py`
+  - loads ONNX object detection models
+  - selects GPU or CPU provider
+  - warms up the model
+
+- `backend/models/face_model.py`
+  - loads InsightFace face recognition models
+  - detects faces and computes embeddings
+  - identifies known faces
+
+- `backend/models/model_loader.py`
+  - manages the global face model and plugin models
+  - provides a single loader interface for the app
+
+- `backend/pipeline/detector_manager.py`
+  - processes frames from cameras
+  - runs object detection and face recognition in parallel
+  - builds detection state for rules and alarms
+
+- `utils/embedding_utils.py`
+  - converts embeddings to bytes for database storage
+  - converts bytes back to embeddings for comparison
+
+- `backend/database/schema.sql`
+  - shows how model plugins, plugin classes, and camera assignments are stored
+  - shows how known faces and embeddings are stored
+
+G. What to remember about this project
+--------------------------------------
+
+- Smart Eye is primarily an inference app, not a training app.
+- The object detection model is a trained YOLO-like model exported to ONNX.
+- The face recognition model is a pretrained InsightFace model.
+- The app loads models, processes frames, and evaluates rules.
+- The ONNX model is used because it is portable and can run on different hardware.
+- The face model is used because embeddings are the best way to recognize people.
+
+H. If you want the simplest explanation
+--------------------------------------
+
+- The app watches cameras.
+- It uses a trained object detector to find safety objects.
+- It uses a trained face model to recognize people.
+- It stores known people as numeric embeddings.
+- It uses ONNX so the object model can run without the training framework.
+- It uses InsightFace so face recognition works with pretrained face embeddings.
+
 1. The project in one simple paragraph
 --------------------------------------
 
@@ -89,7 +246,90 @@ The requirements are listed in:
 requirements.txt
 
 
-4. Very high level architecture
+4. Object Detection in this project
+-----------------------------------
+
+What object detection means
+
+You give the model an image, and it finds:
+
+- where objects are (bounding boxes)
+- what those objects are (classes)
+
+In this project, the main object detection model is:
+
+- `data/models/Obj-Detection.onnx`
+
+What YOLO means
+
+YOLO is a popular object detection method:
+
+- stands for You Only Look Once
+- it scans the image once and produces many boxes + class predictions
+- it is fast and good for real-time video
+
+How YOLO and ONNX fit together here
+
+- The model was trained or fine-tuned as a YOLO-style detector.
+- Then it was exported to ONNX.
+- Smart Eye loads that ONNX file and runs it with ONNX Runtime.
+
+So:
+
+- YOLO = the model architecture / training origin
+- ONNX = the exported file format used by the app
+
+Why ONNX is used
+
+- ONNX is a portable model format.
+- the app does not need the original training framework.
+- onnxruntime can run the model on CPU or GPU.
+- this makes the app simpler and more flexible.
+
+Key files for object detection
+
+- `backend/models/onnx_object_model.py`
+- `backend/models/model_loader.py`
+- `backend/pipeline/detector_manager.py`
+- `backend/database/schema.sql` (`model_plugins`, `plugin_classes`, `camera_plugins`)
+- `frontend/pages/models/_page.py`
+
+5. Face Recognition in this project
+-----------------------------------
+
+What face recognition means here
+
+- The app does not compare raw photos.
+- It converts each face into a vector called an embedding, then compares embeddings.
+
+What model is used
+
+- It uses InsightFace.
+- This is a pretrained face recognition system.
+- The app loads it via `backend/models/face_model.py`.
+
+How face recognition works
+
+1. Detect face in the camera image.
+2. Compute a face embedding vector.
+3. Compare that vector to stored known-face embeddings.
+4. If it matches closely enough, the face is recognized.
+
+Important face recognition concepts
+
+- Embedding = numeric vector representation of a face.
+- Similarity = how close two embeddings are.
+- Threshold = how close they must be to count as the same person.
+
+Key files for face recognition
+
+- `backend/models/face_model.py`
+- `backend/models/model_loader.py`
+- `backend/pipeline/detector_manager.py`
+- `utils/embedding_utils.py`
+- `backend/database/db.py` (known_faces storage)
+
+6. Very high level architecture
 -------------------------------
 
 Think of the project as five cooperating layers:
