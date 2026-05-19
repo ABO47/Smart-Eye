@@ -1,4 +1,6 @@
 ﻿import contextlib
+import importlib
+import sys
 import logging
 
 from PySide6.QtCore import (
@@ -154,7 +156,7 @@ class MainWindow(QMainWindow):
             return
         if self._pages[key] is None:
             try:
-                page = create_page(key, self._rules_service)
+                page = self._page_factory_module().create_page(key, self._rules_service)
                 if page is None:
                     return
                 self._pages[key] = page
@@ -219,20 +221,22 @@ class MainWindow(QMainWindow):
             invalidate_theme_cache()
             with contextlib.suppress(Exception):
                 config.invalidate_cache()
+            self._reload_theme_modules()
+            with contextlib.suppress(Exception):
+                self._page_specs = self._page_factory_module().get_page_specs(self._rules_service)
             loaded_keys = [k for k, v in self._pages.items() if v is not None]
-            self.setStyleSheet(get_theme(self._current_theme))
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(get_theme(self._current_theme))
+            else:
+                self.setStyleSheet(get_theme(self._current_theme))
             if hasattr(self, "_side_border") and self._side_border is not None:
                 self._side_border.setStyleSheet(f"background: {_c._BG_NAV_DARK}; border: none;")
             if hasattr(self, "_sidebar") and hasattr(self._sidebar, "refresh_theme"):
                 self._sidebar.refresh_theme()
-            self._theme_dirty_pages = set(loaded_keys)
 
-
-            current_key = self._current_key or "dashboard"
-            if current_key == "settings":
-                QTimer.singleShot(120, lambda ck=current_key: self._recreate_current_after_theme(ck))
-            elif current_key:
-                QTimer.singleShot(0, lambda ck=current_key: self._recreate_current_after_theme(ck))
+            for key in list(loaded_keys):
+                self._recreate_page(key)
 
 
             self.style().unpolish(self)
@@ -242,6 +246,39 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("Failed to apply theme at runtime")
 
+    def _reload_theme_modules(self) -> None:
+        style_targets = (
+            "frontend.styles._colors",
+            "frontend.styles._btn_styles",
+            "frontend.styles._input_styles",
+            "frontend.styles.page_styles",
+            "frontend.styles.theme_parts",
+        )
+
+        for name in style_targets:
+            module = sys.modules.get(name)
+            if module is not None:
+                with contextlib.suppress(Exception):
+                    importlib.reload(module)
+
+        for name in sorted(sys.modules.keys()):
+            if not (name.startswith("frontend.pages.") or name.startswith("frontend.widgets.")):
+                continue
+            module = sys.modules.get(name)
+            if module is None:
+                continue
+            with contextlib.suppress(Exception):
+                importlib.reload(module)
+
+        module = sys.modules.get("frontend.state.page_factory")
+        if module is not None:
+            with contextlib.suppress(Exception):
+                importlib.reload(module)
+
+    @staticmethod
+    def _page_factory_module():
+        return importlib.import_module("frontend.state.page_factory")
+
     def _bind_settings_page(self, page) -> None:
         if page is None:
             return
@@ -250,6 +287,8 @@ class MainWindow(QMainWindow):
         if hasattr(page, "theme_changed"):
             with contextlib.suppress(Exception):
                 page.theme_changed.disconnect(self._on_theme_changed)
+            with contextlib.suppress(Exception):
+                page.theme_changed.connect(self._on_theme_changed)
 
     def _recreate_current_after_theme(self, expected_key: str) -> None:
         if self._current_key != expected_key:
@@ -280,7 +319,7 @@ class MainWindow(QMainWindow):
                 old.deleteLater()
             self._pages[key] = None
 
-        page = create_page(key, self._rules_service)
+        page = self._page_factory_module().create_page(key, self._rules_service)
         if page is None:
             return
         self._pages[key] = page
