@@ -36,7 +36,7 @@ from frontend.widgets.animated_stack import AnimatedStackedWidget
 from frontend.widgets.sidebar import SidebarWidget, LOGO_ICON_PATH
 from frontend.theme_runtime import invalidate_theme_cache
 from frontend.state.session import build_trusted_user, compute_access, pick_initial_tab
-from utils.auth_validation import get_email_validation_error, is_admin_recovery_code
+from utils.auth_validation import get_email_validation_error
 from utils import config
 
 logger = logging.getLogger(__name__)
@@ -289,6 +289,19 @@ class MainWindow(QMainWindow):
                 page.theme_changed.disconnect(self._on_theme_changed)
             with contextlib.suppress(Exception):
                 page.theme_changed.connect(self._on_theme_changed)
+        if hasattr(page, "tab_transitions_changed"):
+            with contextlib.suppress(Exception):
+                page.tab_transitions_changed.disconnect(self._set_tab_transitions_enabled)
+            with contextlib.suppress(Exception):
+                page.tab_transitions_changed.connect(self._set_tab_transitions_enabled)
+
+    def _set_tab_transitions_enabled(self, enabled: bool) -> None:
+        app = QApplication.instance()
+        widgets = app.allWidgets() if app is not None else []
+        for widget in widgets:
+            if isinstance(widget, AnimatedStackedWidget):
+                with contextlib.suppress(Exception):
+                    widget.setAnimationsEnabled(enabled)
 
     def _recreate_current_after_theme(self, expected_key: str) -> None:
         if self._current_key != expected_key:
@@ -434,7 +447,6 @@ class MainWindow(QMainWindow):
         self._login_card.submit.connect(lambda e, p: self._attempt_login(e, p))
         self._login_card.reset_requested.connect(self._show_reset_card)
         self._reset_card.back.connect(self._show_login_card)
-        self._reset_card.admin_login_requested.connect(self._handle_admin_code_login)
         self._reset_card.load_requested.connect(self._load_reset_questions)
         self._reset_card.submit_requested.connect(self._handle_reset_submit)
 
@@ -523,46 +535,11 @@ class MainWindow(QMainWindow):
         self._on_login_success(account)
 
     def _try_restore_remembered_session(self) -> bool:
-        try:
-            if not self._db.get_bool("remember_login", False):
-                return False
-        except (RuntimeError, AttributeError, TypeError, ValueError, OSError):
-            return False
+        # The retired DB-only automatic session restore is intentionally disabled.
+        # "Remember" now only controls whether the email field is prefilled.
+        return False
 
-        account = None
-        try:
-            remembered_id = str(self._db.get_setting("remember_account_id", "") or "").strip()
-            if remembered_id:
-                account = self._db.get_account(int(remembered_id))
-        except (RuntimeError, AttributeError, TypeError, ValueError, OSError):
-            account = None
-
-        if not account:
-            try:
-                remembered_email = str(self._db.get_setting("remember_email", "") or "").strip()
-                if remembered_email:
-                    row = self._db.get_account_by_email(remembered_email)
-                    if row:
-                        account = self._db.get_account(int(row["id"]))
-            except (RuntimeError, AttributeError, TypeError, ValueError, OSError):
-                account = None
-
-        if not account:
-            with contextlib.suppress(Exception):
-                self._db.set_setting("remember_login", False)
-                self._db.set_setting("remember_email", "")
-                self._db.set_setting("remember_account_id", "")
-            return False
-
-        try:
-            self._db.touch_last_login(account["id"])
-        except (RuntimeError, AttributeError, TypeError, ValueError, OSError):
-            pass
-
-        self._on_login_success(account, restored_session=True)
-        return True
-
-    def _on_login_success(self, account: dict, restored_session: bool = False, update_remembered_login: bool = True):
+    def _on_login_success(self, account: dict, update_remembered_login: bool = True):
         self._session_user = account
         if self._db.bootstrap_password_change_required(account):
             QMessageBox.warning(
@@ -598,14 +575,12 @@ class MainWindow(QMainWindow):
         self._set_auth_error("")
         self._login_card.clear_password()
         if update_remembered_login:
-            if restored_session or self._login_card.remember_me():
+            if self._login_card.remember_me():
                 self._db.set_setting("remember_login", True)
                 self._db.set_setting("remember_email", account.get("email", ""))
-                self._db.set_setting("remember_account_id", account.get("id", ""))
             else:
                 self._db.set_setting("remember_login", False)
                 self._db.set_setting("remember_email", "")
-                self._db.set_setting("remember_account_id", "")
 
     def _on_bootstrap_cleared(self):
         if not self._session_user:
@@ -631,23 +606,37 @@ class MainWindow(QMainWindow):
 
     def _poll_alerts(self):
         try:
-            row = (
+            summary = (
                 self._db.get_conn()
                 .execute(
-                    "SELECT id, camera_id, timestamp, rules_triggered "
-                    "FROM detection_logs WHERE alarm_level>0 AND id>? "
-                    "ORDER BY id DESC LIMIT 1",
+                    "SELECT COUNT(*) AS cnt, MAX(id) AS max_id "
+                    "FROM detection_logs WHERE alarm_level>0 AND id>? ",
                     (self._alert_last_id,),
                 )
                 .fetchone()
             )
+            if not summary or int(summary["cnt"] or 0) <= 0:
+                return
+            count = int(summary["cnt"] or 0)
+            max_id = int(summary["max_id"] or self._alert_last_id)
+            row = (
+                self._db.get_conn()
+                .execute(
+                    "SELECT camera_id, timestamp, rules_triggered "
+                    "FROM detection_logs WHERE id=?",
+                    (max_id,),
+                )
+                .fetchone()
+            )
+            self._alert_last_id = max(self._alert_last_id, max_id)
             if not row:
                 return
-            alert_id, cam_id, ts, rules = row
-            self._alert_last_id = max(self._alert_last_id, int(alert_id))
+            cam_id, ts, rules = row
             subtitle = f"Camera {cam_id} - {ts}"
             if rules:
                 subtitle += f" - {rules}"
+            if count > 1:
+                subtitle = f"{count} new violations. Latest: {subtitle}"
             show_alert(self, "Alert triggered!", subtitle)
         except (RuntimeError, AttributeError, TypeError, ValueError, OSError):
             pass
@@ -718,22 +707,6 @@ class MainWindow(QMainWindow):
         self._reset_card.set_error("")
         self._resize_auth_stack(self._reset_card)
 
-    def _handle_admin_code_login(self, code: str):
-        if not is_admin_recovery_code(code):
-            self._reset_card.set_error("Invalid admin code.")
-            return
-        account = self._db.get_first_admin_account()
-        if not account:
-            self._reset_card.set_error("No admin account is available.")
-            return
-        self._reset_card.set_error("")
-        self._reset_card.clear_answers()
-        self._on_login_success(account, update_remembered_login=False)
-        self._navigate("settings", allow_unauth=True)
-        page = self._pages.get("settings")
-        if page and hasattr(page, "focus_accounts_tab"):
-            page.focus_accounts_tab()
-
     def _handle_reset_submit(self, email: str, answers: list[str], new_pw: str, confirm: str):
         email = (email or "").strip()
         email_error = get_email_validation_error(email, allow_internal=True)
@@ -797,6 +770,10 @@ class MainWindow(QMainWindow):
             from backend.camera.camera_manager import get_camera_manager
 
             get_camera_manager().stop_all()
+        with contextlib.suppress(Exception):
+            from backend.pipeline.alarm_handler import close_handler
+
+            close_handler()
         with contextlib.suppress(Exception):
             from utils.system_monitor import get_monitor
 

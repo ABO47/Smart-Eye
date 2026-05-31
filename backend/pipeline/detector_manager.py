@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 import cv2
 
@@ -34,6 +34,16 @@ def _scale_bbox_up(bbox, scale):
     return [int(bbox[0] * s), int(bbox[1] * s), int(bbox[2] * s), int(bbox[3] * s)]
 
 
+def _scale_points_up(points, scale):
+    if not points:
+        return None
+    try:
+        s = 1.0 / float(scale or 1.0)
+        return [[float(p[0]) * s, float(p[1]) * s] for p in points if len(p) >= 2]
+    except Exception:
+        return None
+
+
 def _iou(a, b):
     try:
         if not a or not b:
@@ -49,7 +59,7 @@ def _iou(a, b):
         return 0.0
 
 
-def _smooth_bbox(prev, curr, alpha=0.6, max_scale_change=0.12):
+def _smooth_bbox(prev, curr, alpha=0.6, max_scale_change=0.12, alpha_size=None, as_float=False):
     try:
         if not prev or not curr:
             return curr
@@ -69,13 +79,16 @@ def _smooth_bbox(prev, curr, alpha=0.6, max_scale_change=0.12):
         ch = max(1.0, cy2 - cy1)
 
         alpha_pos = float(alpha)
-        alpha_size = min(0.82, max(0.55, alpha_pos * 0.78))
+        if alpha_size is None:
+            size_alpha = min(0.82, max(0.55, alpha_pos * 0.78))
+        else:
+            size_alpha = max(0.0, min(1.0, float(alpha_size)))
 
         ncx = alpha_pos * ccx + (1.0 - alpha_pos) * pcx
         ncy = alpha_pos * ccy + (1.0 - alpha_pos) * pcy
 
-        nw = alpha_size * cw + (1.0 - alpha_size) * pw
-        nh = alpha_size * ch + (1.0 - alpha_size) * ph
+        nw = size_alpha * cw + (1.0 - size_alpha) * pw
+        nh = size_alpha * ch + (1.0 - size_alpha) * ph
 
         min_w = pw * (1.0 - max_scale_change)
         max_w = pw * (1.0 + max_scale_change)
@@ -84,12 +97,14 @@ def _smooth_bbox(prev, curr, alpha=0.6, max_scale_change=0.12):
         nw = max(min_w, min(max_w, nw))
         nh = max(min_h, min(max_h, nh))
 
-        nx1 = int(ncx - nw / 2.0)
-        ny1 = int(ncy - nh / 2.0)
-        nx2 = int(ncx + nw / 2.0)
-        ny2 = int(ncy + nh / 2.0)
+        nx1 = ncx - nw / 2.0
+        ny1 = ncy - nh / 2.0
+        nx2 = ncx + nw / 2.0
+        ny2 = ncy + nh / 2.0
 
-        return [nx1, ny1, nx2, ny2]
+        if as_float:
+            return [nx1, ny1, nx2, ny2]
+        return [int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))]
     except Exception:
         return curr
 
@@ -105,8 +120,85 @@ def _bbox_center(box):
     return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
 
+def _bbox_width_height(box):
+    return max(1.0, float(box[2] - box[0])), max(1.0, float(box[3] - box[1]))
+
+
 def _bbox_size(box):
     return max(1.0, float(box[2] - box[0]), float(box[3] - box[1]))
+
+
+def _box_area(box):
+    try:
+        return max(0.0, float(box[2] - box[0])) * max(0.0, float(box[3] - box[1]))
+    except Exception:
+        return 0.0
+
+
+def _box_intersection_area(a, b):
+    try:
+        x1 = max(float(a[0]), float(b[0]))
+        y1 = max(float(a[1]), float(b[1]))
+        x2 = min(float(a[2]), float(b[2]))
+        y2 = min(float(a[3]), float(b[3]))
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    except Exception:
+        return 0.0
+
+
+def _class_name_key(value):
+    return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+
+
+def _face_linked_to_person_box(person_box, face_box):
+    if not person_box or not face_box:
+        return False
+    pcx1, pcy1, pcx2, pcy2 = [float(v) for v in person_box]
+    fcx, fcy = _bbox_center(face_box)
+    face_area = max(1.0, _box_area(face_box))
+    face_inside = pcx1 <= fcx <= pcx2 and pcy1 <= fcy <= pcy2
+    face_overlap = _box_intersection_area(person_box, face_box) / face_area
+    return face_inside or face_overlap >= 0.35
+
+
+def _bbox_scale_delta(prev, curr):
+    try:
+        pw = max(1.0, float(prev[2] - prev[0]))
+        ph = max(1.0, float(prev[3] - prev[1]))
+        cw = max(1.0, float(curr[2] - curr[0]))
+        ch = max(1.0, float(curr[3] - curr[1]))
+        return max(abs(cw - pw) / pw, abs(ch - ph) / ph)
+    except Exception:
+        return 1.0
+
+
+def _box_from_center(cx, cy, w, h):
+    return [float(cx) - (float(w) / 2.0), float(cy) - (float(h) / 2.0), float(cx) + (float(w) / 2.0), float(cy) + (float(h) / 2.0)]
+
+
+def _landmark_motion_center(landmarks):
+    if not landmarks:
+        return None
+    pts = []
+    for p in landmarks:
+        try:
+            if len(p) >= 2:
+                pts.append((float(p[0]), float(p[1])))
+        except Exception:
+            continue
+    if len(pts) < 3:
+        return None
+
+    if len(pts) >= 5:
+        left_eye, right_eye, nose, mouth_l, mouth_r = pts[:5]
+        eye_mid = ((left_eye[0] + right_eye[0]) / 2.0, (left_eye[1] + right_eye[1]) / 2.0)
+        mouth_mid = ((mouth_l[0] + mouth_r[0]) / 2.0, (mouth_l[1] + mouth_r[1]) / 2.0)
+        return (
+            (eye_mid[0] * 0.30) + (nose[0] * 0.45) + (mouth_mid[0] * 0.25),
+            (eye_mid[1] * 0.30) + (nose[1] * 0.45) + (mouth_mid[1] * 0.25),
+        )
+
+    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
 
 
 def _shift_bbox(box, dx, dy):
@@ -137,17 +229,21 @@ def _adaptive_smoothing_alpha(rel_move, match_iou):
     if rel >= 1.10:
         return 0.96
     if rel >= 0.75:
-        return 0.93
+        return 0.92
     if rel >= 0.45:
-        return 0.88
+        return 0.84
     if rel >= 0.25:
-        return 0.82
+        return 0.72
+    if rel >= 0.12:
+        return 0.60
 
     if iou < 0.25:
-        return 0.90
-    if iou < 0.45:
         return 0.84
-    return 0.76
+    if iou < 0.45:
+        return 0.72
+    if iou < 0.70:
+        return 0.56
+    return 0.42
 
 
 def _adaptive_object_smoothing_alpha(rel_move, match_iou):
@@ -474,25 +570,27 @@ class DetectorManager:
         results = []
         for face in faces:
             face["bbox"] = _scale_bbox_up(face["bbox"], scale)
+            landmarks = _scale_points_up(face.get("landmarks"), scale)
             try:
                 x1, y1, x2, y2 = face["bbox"]
                 if (x2 - x1) < min_face_size or (y2 - y1) < min_face_size:
                     continue
             except Exception:
                 continue
-            results.append(
-                {
-                    "bbox": face["bbox"],
-                    "det_score": face.get("det_score", 1.0),
-                    "identity": None,
-                    # Keep confidence numeric for downstream ranking/aggregation paths.
-                    "confidence": float(face.get("det_score", 0.0) or 0.0),
-                    "embedding": face.get("embedding"),
-                    "liveness": None,
-                    "gender": face.get("gender", "unknown"),
-                    "gender_confidence": face.get("gender_confidence", 0.0),
-                }
-            )
+            result = {
+                "bbox": face["bbox"],
+                "det_score": face.get("det_score", 1.0),
+                "identity": None,
+                # Keep confidence numeric for downstream ranking/aggregation paths.
+                "confidence": float(face.get("det_score", 0.0) or 0.0),
+                "embedding": face.get("embedding"),
+                "liveness": None,
+                "gender": face.get("gender", "unknown"),
+                "gender_confidence": face.get("gender_confidence", 0.0),
+            }
+            if landmarks:
+                result["landmarks"] = landmarks
+            results.append(result)
         return results, (time.time() - t0) * 1000
 
     def _run_plugin(self, pid, small, scale, camera_id):
@@ -593,10 +691,21 @@ class DetectorManager:
 
     def _collect_futures(self, futures):
         faces, objects, face_ms, obj_ms = [], [], 0.0, 0.0
-        timeout_s = 30.0
+        if not futures:
+            return faces, objects, face_ms, obj_ms
+        try:
+            timeout_s = max(0.2, float(config.get("inference_future_timeout_sec", 2.0) or 2.0))
+        except Exception:
+            timeout_s = 2.0
+        done, not_done = wait(list(futures.values()), timeout=timeout_s)
+        for fut in not_done:
+            fut.cancel()
         for key, fut in futures.items():
+            if fut not in done:
+                logger.warning("Inference future timed out for key %s after %.2fs", key, timeout_s)
+                continue
             try:
-                data, ms = fut.result(timeout=timeout_s)
+                data, ms = fut.result(timeout=0)
                 if key == "faces":
                     faces = data
                     face_ms = ms
@@ -715,6 +824,62 @@ class DetectorManager:
             self._camera_settings_cache[camera_id] = (now, cam)
         return cam
 
+    def _filter_object_quality(self, objects, faces, frame_shape):
+        if not objects:
+            return objects
+
+        try:
+            frame_h, frame_w = frame_shape[:2]
+        except Exception:
+            frame_h = frame_w = 0
+        frame_area = max(1.0, float(frame_w) * float(frame_h))
+        face_boxes = [f.get("bbox") for f in faces or [] if f.get("bbox")]
+
+        try:
+            min_area_ratio = max(0.0, float(config.get("object_min_area_ratio", 0.00045) or 0.00045))
+        except Exception:
+            min_area_ratio = 0.00045
+        try:
+            weak_person_conf = max(0.0, min(1.0, float(config.get("person_weak_detection_confidence", 0.65) or 0.65)))
+        except Exception:
+            weak_person_conf = 0.65
+        try:
+            tiny_person_area = max(0.0, float(config.get("person_tiny_area_ratio", 0.018) or 0.018))
+        except Exception:
+            tiny_person_area = 0.018
+
+        filtered = []
+        dropped = 0
+        for obj in objects:
+            box = obj.get("bbox")
+            if not box or len(box) != 4:
+                dropped += 1
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box]
+            bw = max(0.0, x2 - x1)
+            bh = max(0.0, y2 - y1)
+            area_ratio = (bw * bh) / frame_area
+            if bw < 4.0 or bh < 4.0 or area_ratio < min_area_ratio:
+                dropped += 1
+                continue
+
+            cls_key = _class_name_key(obj.get("class_name") or obj.get("class"))
+            conf = _as_float(obj.get("confidence", obj.get("det_score", 0.0)))
+
+            if cls_key == "person":
+                linked_to_face = any(_face_linked_to_person_box(box, face_box) for face_box in face_boxes)
+                weak_without_face = face_boxes and conf < weak_person_conf and not linked_to_face
+                tiny_weak_person = area_ratio < tiny_person_area and conf < max(weak_person_conf, 0.70)
+                if weak_without_face or tiny_weak_person:
+                    dropped += 1
+                    continue
+
+            filtered.append(obj)
+
+        if dropped:
+            logger.debug("Filtered %d low-quality object detections", dropped)
+        return filtered
+
     def _rebuild_trackers(self, camera_id, faces, objects, max_trackers):
         state = self._get_camera_state(camera_id)
         now_ts = time.time()
@@ -732,6 +897,7 @@ class DetectorManager:
                     "confidence": f.get("confidence"),
                     "det_score": f.get("det_score"),
                     "embedding": f.get("embedding"),
+                    "landmarks": f.get("landmarks"),
                     "liveness": f.get("liveness", 1.0),
                     "gender": f.get("gender", "unknown"),
                     "gender_confidence": f.get("gender_confidence", 0.0),
@@ -829,6 +995,7 @@ class DetectorManager:
                             "_det_score": 0.0,
                             "_gender": "unknown",
                             "_gender_conf": 0.0,
+                            "lm_center": None,
                         }
                     )
                     continue
@@ -866,15 +1033,61 @@ class DetectorManager:
                     cx_curr, cy_curr = _bbox_center(curr_box)
                     move_dist = ((cx_prev - cx_curr) ** 2 + (cy_prev - cy_curr) ** 2) ** 0.5
                     rel_move = move_dist / _bbox_size(curr_box)
-                    alpha = _adaptive_smoothing_alpha(rel_move, best_iou)
-                    f["bbox"] = _smooth_bbox(pb, curr_box, alpha=alpha)
-                    sbx, sby = _bbox_center(f["bbox"])
-                    inst_vx = sbx - cx_prev
-                    inst_vy = sby - cy_prev
                     prev_vx = _as_float(matched.get("vx", 0.0))
                     prev_vy = _as_float(matched.get("vy", 0.0))
-                    vx = (0.55 * prev_vx) + (0.45 * inst_vx)
-                    vy = (0.55 * prev_vy) + (0.45 * inst_vy)
+                    lm_center = _landmark_motion_center(f.get("landmarks"))
+                    prev_lm_center = matched.get("lm_center")
+                    if lm_center and prev_lm_center:
+                        lm_dx = lm_center[0] - float(prev_lm_center[0])
+                        lm_dy = lm_center[1] - float(prev_lm_center[1])
+                        pred_cx = cx_prev + lm_dx
+                        pred_cy = cy_prev + lm_dy
+                        residual = (((pred_cx - cx_curr) ** 2 + (pred_cy - cy_curr) ** 2) ** 0.5) / _bbox_size(curr_box)
+                        anchor_weight = 0.82 if residual <= 0.16 else (0.64 if residual <= 0.34 else 0.42)
+                        ncx = (pred_cx * anchor_weight) + (cx_curr * (1.0 - anchor_weight))
+                        ncy = (pred_cy * anchor_weight) + (cy_curr * (1.0 - anchor_weight))
+
+                        pw, ph = _bbox_width_height(pb)
+                        cw, ch = _bbox_width_height(curr_box)
+                        scale_delta = _bbox_scale_delta(pb, curr_box)
+                        size_alpha = 0.08 if scale_delta <= 0.12 else (0.18 if scale_delta <= 0.28 else 0.36)
+                        nw = (pw * (1.0 - size_alpha)) + (cw * size_alpha)
+                        nh = (ph * (1.0 - size_alpha)) + (ch * size_alpha)
+                        max_scale_change = 0.04 if scale_delta <= 0.12 else 0.10
+                        nw = max(pw * (1.0 - max_scale_change), min(pw * (1.0 + max_scale_change), nw))
+                        nh = max(ph * (1.0 - max_scale_change), min(ph * (1.0 + max_scale_change), nh))
+                        smooth_box = _box_from_center(ncx, ncy, nw, nh)
+                        vx = (0.35 * prev_vx) + (0.65 * (ncx - cx_prev))
+                        vy = (0.35 * prev_vy) + (0.65 * (ncy - cy_prev))
+                    else:
+                        scale_delta = _bbox_scale_delta(pb, curr_box)
+                        jitter_px = max(1.25, min(5.0, _bbox_size(curr_box) * 0.018))
+                        if best_iou >= 0.72 and move_dist <= jitter_px and scale_delta <= 0.045:
+                            smooth_box = _smooth_bbox(
+                                pb,
+                                curr_box,
+                                alpha=0.18,
+                                alpha_size=0.0,
+                                max_scale_change=0.025,
+                                as_float=True,
+                            )
+                            vx = prev_vx * 0.25
+                            vy = prev_vy * 0.25
+                        else:
+                            alpha = _adaptive_smoothing_alpha(rel_move, best_iou)
+                            smooth_box = _smooth_bbox(pb, curr_box, alpha=alpha, max_scale_change=0.10, as_float=True)
+                            sbx, sby = _bbox_center(smooth_box)
+                            inst_vx = sbx - cx_prev
+                            inst_vy = sby - cy_prev
+                            vx = (0.45 * prev_vx) + (0.55 * inst_vx)
+                            vy = (0.45 * prev_vy) + (0.55 * inst_vy)
+
+                    velocity_deadband = max(0.28, min(1.15, _bbox_size(curr_box) * 0.004))
+                    if abs(vx) < velocity_deadband:
+                        vx = 0.0
+                    if abs(vy) < velocity_deadband:
+                        vy = 0.0
+                    f["bbox"] = [int(round(v)) for v in smooth_box]
 
                 f["track_vx"] = vx
                 f["track_vy"] = vy
@@ -882,7 +1095,7 @@ class DetectorManager:
                 new_face_state.append(
                     {
                         "id": ident,
-                        "bbox": f.get("bbox"),
+                        "bbox": smooth_box if matched and matched.get("bbox") else f.get("bbox"),
                         "vx": vx,
                         "vy": vy,
                         "last_seen": now,
@@ -892,6 +1105,7 @@ class DetectorManager:
                         "_det_score": f.get("det_score", 0.0),
                         "_gender": f.get("gender", "unknown"),
                         "_gender_conf": f.get("gender_confidence", 0.0),
+                        "lm_center": _landmark_motion_center(f.get("landmarks")),
                     }
                 )
 
@@ -928,6 +1142,7 @@ class DetectorManager:
                 )
 
                 vx = vy = 0.0
+                smooth_box = None
                 if matched and matched.get("bbox"):
                     sb_prev = matched["bbox"]
                     cx_prev, cy_prev = _bbox_center(sb_prev)
@@ -935,42 +1150,60 @@ class DetectorManager:
                     move_dist = ((cx_prev - cx_curr) ** 2 + (cy_prev - cy_curr) ** 2) ** 0.5
                     rel_move = move_dist / _bbox_size(curr_box)
                     if use_stable_object_bboxes:
-                        if best_iou >= 0.72 and rel_move <= 0.045:
-                            o["bbox"] = [int(v) for v in sb_prev]
+                        scale_delta = _bbox_scale_delta(sb_prev, curr_box)
+                        jitter_px = max(1.5, min(7.0, _bbox_size(curr_box) * 0.02))
+                        if best_iou >= 0.72 and move_dist <= jitter_px and scale_delta <= 0.05:
+                            smooth_box = _smooth_bbox(
+                                sb_prev,
+                                curr_box,
+                                alpha=0.12,
+                                alpha_size=0.0,
+                                max_scale_change=0.02,
+                                as_float=True,
+                            )
+                            o["bbox"] = [int(round(v)) for v in smooth_box]
                             prev_vx = _as_float(matched.get("vx", 0.0))
                             prev_vy = _as_float(matched.get("vy", 0.0))
-                            vx = prev_vx * 0.45
-                            vy = prev_vy * 0.45
+                            vx = prev_vx * 0.25
+                            vy = prev_vy * 0.25
                         else:
                             alpha = _adaptive_object_smoothing_alpha(rel_move, best_iou)
                             if rel_move < 0.04:
                                 alpha = min(alpha, 0.38)
-                            o["bbox"] = _smooth_bbox(sb_prev, curr_box, alpha=alpha, max_scale_change=0.06)
-                            sbx, sby = _bbox_center(o["bbox"])
+                            smooth_box = _smooth_bbox(
+                                sb_prev,
+                                curr_box,
+                                alpha=alpha,
+                                max_scale_change=0.06,
+                                as_float=True,
+                            )
+                            o["bbox"] = [int(round(v)) for v in smooth_box]
+                            sbx, sby = _bbox_center(smooth_box)
                             inst_vx = sbx - cx_prev
                             inst_vy = sby - cy_prev
                             prev_vx = _as_float(matched.get("vx", 0.0))
                             prev_vy = _as_float(matched.get("vy", 0.0))
                             vx = (0.75 * prev_vx) + (0.25 * inst_vx)
                             vy = (0.75 * prev_vy) + (0.25 * inst_vy)
-                            if abs(vx) < 0.14:
+                            if abs(vx) < 0.35:
                                 vx = 0.0
-                            if abs(vy) < 0.14:
+                            if abs(vy) < 0.35:
                                 vy = 0.0
                     else:
                         alpha = _adaptive_smoothing_alpha(rel_move, best_iou)
                         alpha = min(0.92, max(0.72, alpha + 0.08))
-                        o["bbox"] = _smooth_bbox(sb_prev, curr_box, alpha=alpha, max_scale_change=0.12)
-                        sbx, sby = _bbox_center(o["bbox"])
+                        smooth_box = _smooth_bbox(sb_prev, curr_box, alpha=alpha, max_scale_change=0.12, as_float=True)
+                        o["bbox"] = [int(round(v)) for v in smooth_box]
+                        sbx, sby = _bbox_center(smooth_box)
                         inst_vx = sbx - cx_prev
                         inst_vy = sby - cy_prev
                         prev_vx = _as_float(matched.get("vx", 0.0))
                         prev_vy = _as_float(matched.get("vy", 0.0))
                         vx = (0.55 * prev_vx) + (0.45 * inst_vx)
                         vy = (0.55 * prev_vy) + (0.45 * inst_vy)
-                        if abs(vx) < 0.10:
+                        if abs(vx) < 0.25:
                             vx = 0.0
-                        if abs(vy) < 0.10:
+                        if abs(vy) < 0.25:
                             vy = 0.0
 
                 o["track_vx"] = vx
@@ -980,7 +1213,7 @@ class DetectorManager:
                     {
                         "plugin": plugin,
                         "class": cls,
-                        "bbox": o.get("bbox"),
+                        "bbox": smooth_box if smooth_box is not None else o.get("bbox"),
                         "vx": vx,
                         "vy": vy,
                         "last_seen": now,
@@ -1016,21 +1249,24 @@ class DetectorManager:
         logger.debug("Frame %d: faces=%d objects=%d", frame_idx, len(faces), len(objects))
 
         objects = self._filter_allowed_objects(objects)
+        objects = self._filter_object_quality(objects, faces, frame.shape)
         if faces and identify_faces and not lightweight:
             self._identify_faces_for_frame(camera_id, faces, aggressive_mode, max_identify, small, frame_idx)
 
         if not lightweight:
             if faces or objects:
-                self._rebuild_trackers(camera_id, faces, objects, max_trackers)
-            self._apply_smoothing(camera_id, faces, objects)
+                self._apply_smoothing(camera_id, faces, objects)
 
             # Evaluate liveness after smoothing so bbox jitter/resets don't
             # break per-face liveness tracks that rely on stable coordinates.
             if faces and self._liveness is not None:
                 try:
-                    self._evaluate_liveness_for_frame(camera_id, faces, frame, frame_idx)
+                    self._evaluate_liveness_for_frame(camera_id, faces, objects, frame, frame_idx)
                 except Exception:
                     logger.debug("Liveness evaluation failed for camera %s", camera_id, exc_info=True)
+
+            if faces or objects:
+                self._rebuild_trackers(camera_id, faces, objects, max_trackers)
 
         return {
             "faces": faces,
@@ -1065,7 +1301,7 @@ class DetectorManager:
             existing_trackers = list(state.trackers)
         self._identify_faces(camera_id, faces_for_identify, existing_trackers, aggressive_mode, max_identify, frame_for_liveness, frame_idx)
 
-    def _evaluate_liveness_for_frame(self, camera_id, faces, frame_for_liveness, frame_idx):
+    def _evaluate_liveness_for_frame(self, camera_id, faces, objects, frame_for_liveness, frame_idx):
         try:
             for f in faces:
                 try:
@@ -1077,9 +1313,25 @@ class DetectorManager:
                 except Exception:
                     liveness_required = False
 
+                if not liveness_required and self._liveness is not None and f.get("identity"):
+                    try:
+                        block_presentations = config.get("liveness_block_screen_presentations", True)
+                        if isinstance(block_presentations, str):
+                            block_presentations = block_presentations.strip().lower() in ("1", "true", "yes", "on")
+                        if block_presentations and self._liveness.detect_presentation_attack(frame_for_liveness, f, objects=objects):
+                            f["liveness"] = 0.0
+                            f["_spoof_type"] = "screen_presentation"
+                            f.pop("_liveness_pending", None)
+                            f.pop("_liveness_seconds_left", None)
+                            continue
+                    except Exception:
+                        logger.debug("Presentation check failed for camera %s", camera_id, exc_info=True)
+
                 if liveness_required and self._liveness is not None:
                     try:
-                        lval, spoof, pending, seconds_left = self._liveness.evaluate(camera_id, frame_for_liveness, f, frame_idx)
+                        lval, spoof, pending, seconds_left = self._liveness.evaluate(
+                            camera_id, frame_for_liveness, f, frame_idx, objects=objects
+                        )
                         f["liveness"] = lval
                         if spoof:
                             f["_spoof_type"] = spoof
@@ -1092,11 +1344,18 @@ class DetectorManager:
                             except Exception:
                                 f["_liveness_seconds_left"] = 0.0
                         else:
+                            f.pop("_spoof_type", None)
                             f.pop("_liveness_pending", None)
                             f.pop("_liveness_seconds_left", None)
                     except Exception:
+                        f.pop("_spoof_type", None)
+                        f.pop("_liveness_pending", None)
+                        f.pop("_liveness_seconds_left", None)
                         f["liveness"] = 1.0
                 else:
+                    f.pop("_spoof_type", None)
+                    f.pop("_liveness_pending", None)
+                    f.pop("_liveness_seconds_left", None)
                     f["liveness"] = 1.0
         except Exception:
             logger.debug("_evaluate_liveness_for_frame failed", exc_info=True)
